@@ -42,8 +42,9 @@ python3 main.py
 
 Then click the **Web Preview** button in the top-right corner of Cloud Shell and select **Preview on port 8080**.
 
-> **Stopping the Local Server in Cloud Shell:**
-> * To stop the running Dash server, return to the Cloud Shell terminal and press **`Ctrl+C`**.
+> **⚠️ Important — Stopping the Server in Cloud Shell:**
+> * Always return to the Cloud Shell terminal and press **`Ctrl+C`** to stop the Dash server when you are done testing. If you do not press `Ctrl+C`, the process will keep running in the background and consume your weekly Cloud Shell hours until Google freezes your compute environment.
+> * If you closed or lost the terminal tab that started the process, click the **More (`⋮`)** icon in the top-right corner of the Cloud Shell toolbar and select **Restart** to restart the Cloud Shell machine (or restart your computer).
 > * To exit the Python virtual environment when you are done, run:
 >   ```bash
 >   deactivate
@@ -128,9 +129,7 @@ Open your browser to:
 #### How to Stop the Service on Your Local Computer
 
 1. **Stop the Dash web server:** Click inside the terminal window where `python3 main.py` is running and press **`Ctrl+C`**.
-   * *If port `8080` ever remains occupied by a background process:*
-     * On **macOS / Linux**: run `lsof -ti:8080 | xargs kill -9`
-     * On **Windows (Git Bash / CMD)**: run `npx kill-port 8080` or `netstat -ano | findstr :8080` followed by `taskkill /PID <PID> /F`
+   * **Important:** If you do not press `Ctrl+C`, the server will continue running in the background and holding port `8080`. If you lost or closed the terminal window that started the process, **restart your computer** (or kill the process occupying port `8080`: `lsof -ti:8080 | xargs kill -9` on macOS/Linux, or `npx kill-port 8080` on Windows).
 2. **Deactivate the virtual environment (optional):** When you are finished working on the project, run:
    ```bash
    deactivate
