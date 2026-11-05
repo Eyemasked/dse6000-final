@@ -169,14 +169,58 @@ Open your browser to:
 
 ---
 
+## Best Practices & Troubleshooting Guide
+
+If your deployment or application fails on GCP, open **Logs Explorer** (by searching for `Logs Explorer` in the top search bar of the Google Cloud Console, or navigating to **Cloud Run $\rightarrow$ `dash-gcp-app` $\rightarrow$ Logs**) to inspect the error stack trace. Below are the most common issues and best practices:
+
+1. **Pre-Train and Save ML Models Ahead of Time (`pickle` / `joblib`) — Do NOT Train at App Startup:**
+   * If your dashboard uses a `scikit-learn` or `statsmodels` model, **do not train the model inside `main.py` when the Dash app starts**. Training on startup slows down container cold-starts and can exceed Cloud Run memory/startup timeouts.
+   * Instead, write a standalone training script (e.g., `train_model.py`), run `python3 train_model.py` once from the terminal to save the trained model into `data/model.pkl` using `pickle` or `joblib`, and load `data/model.pkl` inside `main.py` to run predictions:
+     ```python
+     import joblib
+     from pathlib import Path
+
+     DATA_DIR = Path(__file__).resolve().parent / "data"
+     model = joblib.load(DATA_DIR / "model.pkl")
+     ```
+2. **Always Use Relative Paths for Data & Model Files:**
+   * Never use hardcoded absolute paths from your laptop or Cloud Shell (such as `/Users/yourname/...` or `/home/...`). They will fail with `FileNotFoundError` inside the Cloud Run container.
+   * Place datasets and saved `.pkl` models inside the `data/` folder and reference them via `Path(__file__).resolve().parent / "data" / "myfile.csv"` (or `'data/myfile.csv'`).
+3. **Do Not Write Persistent Files to the Local Filesystem at Runtime:**
+   * Treat the Cloud Run container filesystem as read-only at runtime. Any files written to disk by a running container are stored in temporary memory and wiped when the instance scales down. Use `io.BytesIO()` for in-memory plots/downloads.
+4. **Keep `requirements.txt` Updated When Installing New Packages:**
+   * Whenever you install a new package locally with `pip install <package>` (or `conda`), you **must** add that package to `requirements.txt`. Cloud Build only installs packages listed in `requirements.txt`.
+   * To check the exact version of an installed package in your active virtual environment, run `python3 -m pip list` or `python3 -m pip freeze` ([pip freeze docs](https://pip.pypa.io/en/stable/cli/pip_freeze/)).
+5. **Increasing Memory or CPU for Larger Datasets:**
+   * By default, `run.sh` deploys the Cloud Run service with `1Gi` of memory (`--memory=1Gi`) and `1` vCPU (`--cpu=1`). If your dataset or ML model requires more memory, edit `--memory=2Gi` (or `4Gi`) in `run.sh` and redeploy with `./run.sh --force`.
+6. **GCP Account & Billing Credits:**
+   * Ensure you are authenticated with your **personal Gmail account** rather than an institutional/university email account (such as `@umich.edu`), which often restricts project creation and IAM permissions.
+   * You can check your remaining GCP credits by searching for **Billing** in the top search bar of the GCP Console. **Do NOT enter your personal credit card information at any time**—if you run low on credits, request a course coupon.
+7. **Port 8080 Already in Use & Cloud Shell Lockout:**
+   * Running `python3 main.py` starts a development server accessible only to you. Always shut it down with **`Ctrl+C`** when you finish testing. Leaving it running in Google Cloud Shell will exhaust your weekly quota and lock your Cloud Shell environment.
+   * If you try to run `python3 main.py` while another instance is already running, you will see a `Port 8080 is in use` error. If you closed the terminal tab that started the server, restart Cloud Shell via the three-dots icon (**`⋮` $\rightarrow$ Restart**) in the top navigation bar, or restart your local computer.
+   * Once your app is deployed to Cloud Run via `./run.sh`, your public `.run.app` URL stays live on Google's infrastructure—you can safely stop your local server and close Cloud Shell.
+8. **Commit and Push Your Code to Git Regularly:**
+   * Especially when working in Google Cloud Shell, commit and push your changes (`git add . && git commit -m "..." && git push`) periodically so you never lose your work.
+
+---
+
 ## Project Configuration & Example Files
 
 1. **`main.py`**: Primary Dash application entrypoint exposing `server = app.server` for Gunicorn.
 2. **`requirements.txt`**: Top-level Python dependencies (`dash`, `plotly`, `pandas`, `numpy`, `scipy`, `scikit-learn`, `statsmodels`, `matplotlib`, `seaborn`, `gunicorn`).
 3. **`Dockerfile` & `run.sh`**: Used to containerize and deploy the application to **Google Cloud Run**.
-4. **`data/`**: Directory for datasets loaded relative to the project root (see `main.py` using `pathlib.Path`).
+4. **`data/`**: Directory for datasets and pre-trained model files loaded relative to the project root (see `main.py` using `pathlib.Path`).
 5. **`examples/`**: Standalone scripts demonstrating core Dash features (stop any running server with `Ctrl+C` before starting another example on port `8080`):
    * `python3 examples/eg1-simple.py` – Basic HTML layout components
    * `python3 examples/eg2-app-callback.py` – Reactive callbacks with numeric inputs
    * `python3 examples/eg3-matplotlib-image.py` – Rendering a Seaborn/Matplotlib figure in Dash
    * `python3 examples/eg4-dropdown.py` – Interactive cross-filtering with dropdowns, radio items, and sliders
+
+## Useful References
+
+* **Dash Layout Guide:** [https://dash.plotly.com/layout](https://dash.plotly.com/layout)
+* **Dash Core Components (`dcc`):** [https://dash.plotly.com/dash-core-components](https://dash.plotly.com/dash-core-components)
+* **Plotly Express Arguments:** [https://plotly.com/python/px-arguments/](https://plotly.com/python/px-arguments/)
+* **Creating & Updating Figures in Plotly:** [https://plotly.com/python/creating-and-updating-figures/](https://plotly.com/python/creating-and-updating-figures/)
+* **Plotly Pandas Backend (`df.plot()`):** [https://plotly.com/python/pandas-backend/](https://plotly.com/python/pandas-backend/)
