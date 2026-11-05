@@ -1,27 +1,47 @@
-import dash
-from dash import html
-import pandas as pd
-import seaborn as sns
-import io
-import matplotlib.pyplot as plt
 import base64
+import io
 
-app = dash.Dash(__name__)
+from dash import Dash, html
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+app = Dash(__name__)
 server = app.server
 
-titanic_df = sns.load_dataset('titanic')
-fig = sns.catplot(x="sex", y="age", hue="survived", col="pclass", data=titanic_df, kind="bar", errorbar=None,
-                  height=4, aspect=.7)
 
-fig.set_axis_labels("", "Mean Age")
+def create_titanic_plot() -> str:
+    titanic_df = sns.load_dataset("titanic")
+    grid = sns.catplot(
+        x="sex",
+        y="age",
+        hue="survived",
+        col="pclass",
+        data=titanic_df,
+        kind="bar",
+        errorbar=None,
+        height=4,
+        aspect=0.7,
+    )
+    grid.set_axis_labels("", "Mean Age")
 
-buf = io.BytesIO() # create an in-memory buffer
-plt.savefig(buf, format = "png")  # save your image into this buffer
-plt.close()
-data = "data:image/png;base64,{}".format(base64.b64encode(buf.getbuffer()).decode("utf8"))
-buf.close()
-app.layout = html.Img(id='example', src=data)
+    with io.BytesIO() as buf:
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(grid.figure)
+        encoded = base64.b64encode(buf.getbuffer()).decode("utf-8")
+
+    return f"data:image/png;base64,{encoded}"
 
 
-if __name__ == '__main__':
-    app.run_server(debug=True, port=8080)
+app.layout = html.Div(
+    [
+        html.H2("Matplotlib / Seaborn Figure in Dash"),
+        html.Img(id="example", src=create_titanic_plot()),
+    ]
+)
+
+if __name__ == "__main__":
+    app.run(debug=True, port=8080)
+
