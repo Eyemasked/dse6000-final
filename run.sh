@@ -226,9 +226,64 @@ else
 
     PROJECT_COUNT=${#PROJECT_IDS[@]}
     if [ "$PROJECT_COUNT" -eq 0 ]; then
-        echo "⚠️  No projects returned by 'gcloud projects list'."
-        read -p "👉 Please enter the target GCP Project ID manually: " PROJECT_ID
-        PROJECT_ID=$(echo "$PROJECT_ID" | xargs)
+        echo "⚠️  No active Google Cloud projects found."
+        read -p "👉 Would you like to create a new GCP project now? [Y/n]: " CREATE_CHOICE
+        CREATE_CHOICE=$(echo "$CREATE_CHOICE" | xargs)
+
+        if [[ -z "$CREATE_CHOICE" || "$CREATE_CHOICE" =~ ^[Yy] ]]; then
+            DEFAULT_NEW_PROJECT_ID="dash-gcp-$((RANDOM % 90000 + 10000))"
+            read -p "👉 Enter a new Project ID (default: $DEFAULT_NEW_PROJECT_ID): " NEW_PROJECT_ID
+            NEW_PROJECT_ID=$(echo "$NEW_PROJECT_ID" | xargs)
+            PROJECT_ID="${NEW_PROJECT_ID:-$DEFAULT_NEW_PROJECT_ID}"
+
+            read -p "👉 Enter a display name for the project (default: $PROJECT_ID): " NEW_PROJECT_NAME
+            NEW_PROJECT_NAME=$(echo "$NEW_PROJECT_NAME" | xargs)
+            PROJECT_NAME="${NEW_PROJECT_NAME:-$PROJECT_ID}"
+
+            echo ""
+            run_step "Create GCP Project '$PROJECT_ID'" "gcloud projects create \"$PROJECT_ID\" --name=\"$PROJECT_NAME\""
+
+            # Check if an open billing account is available to link (required for Cloud Run & Cloud Build APIs)
+            BILLING_ACCOUNTS=()
+            BILLING_NAMES=()
+            while IFS=$'\t' read -r bid bname; do
+                if [ -n "$bid" ]; then
+                    BILLING_ACCOUNTS+=("$bid")
+                    BILLING_NAMES+=("$bname")
+                fi
+            done < <(gcloud billing accounts list --filter="open=true" --format="value(name.basename(),displayName)" 2>/dev/null)
+
+            BILLING_COUNT=${#BILLING_ACCOUNTS[@]}
+            if [ "$BILLING_COUNT" -eq 1 ]; then
+                echo "💳 Found active billing account: ${BILLING_NAMES[0]} (${BILLING_ACCOUNTS[0]})"
+                read -p "👉 Link this billing account to '$PROJECT_ID'? [Y/n]: " LINK_BILLING
+                LINK_BILLING=$(echo "$LINK_BILLING" | xargs)
+                if [[ -z "$LINK_BILLING" || "$LINK_BILLING" =~ ^[Yy] ]]; then
+                    run_step "Link Billing Account to '$PROJECT_ID'" "gcloud billing projects link \"$PROJECT_ID\" --billing-account=\"${BILLING_ACCOUNTS[0]}\""
+                fi
+            elif [ "$BILLING_COUNT" -gt 1 ]; then
+                echo ""
+                echo "Available Billing Accounts:"
+                echo "--------------------------------------------------"
+                for (( i=0; i<BILLING_COUNT; i++ )); do
+                    idx=$((i + 1))
+                    printf "  %2d) %-24s (%s)\n" "$idx" "${BILLING_ACCOUNTS[$i]}" "${BILLING_NAMES[$i]}"
+                done
+                echo "--------------------------------------------------"
+                read -p "👉 Select a billing account to link [1-$BILLING_COUNT] (or press Enter to skip): " BILLING_CHOICE
+                BILLING_CHOICE=$(echo "$BILLING_CHOICE" | xargs)
+                if [[ "$BILLING_CHOICE" =~ ^[0-9]+$ ]] && [ "$BILLING_CHOICE" -ge 1 ] && [ "$BILLING_CHOICE" -le "$BILLING_COUNT" ]; then
+                    SELECTED_BILLING="${BILLING_ACCOUNTS[$((BILLING_CHOICE - 1))]}"
+                    run_step "Link Billing Account to '$PROJECT_ID'" "gcloud billing projects link \"$PROJECT_ID\" --billing-account=\"$SELECTED_BILLING\""
+                fi
+            else
+                echo "⚠️  Note: No active billing accounts detected via gcloud. Make sure billing is enabled for '$PROJECT_ID' in the GCP Console before enabling APIs."
+                echo ""
+            fi
+        else
+            read -p "👉 Please enter an existing target GCP Project ID manually: " PROJECT_ID
+            PROJECT_ID=$(echo "$PROJECT_ID" | xargs)
+        fi
     else
         echo ""
         echo "Available GCP Projects:"
