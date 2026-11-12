@@ -1,16 +1,19 @@
 #!/bin/bash
 # ==============================================================================
-# Plotly Dash App - Local API Setup & Google Cloud Run Deployment Script
+# Plotly Dash App - Local Setup & Google Cloud Run Deployment Script
 # ==============================================================================
 # What this script does:
-#   1. Prompts you to pick a Google Cloud Project from a numbered list [1-N].
-#   2. Enables the required Google Cloud APIs (Cloud Run, Artifact Registry,
-#      Cloud Build, IAM, and Cloud Logging).
+#   1. Prompts you to pick an existing Google Cloud Project from a numbered list [1-N],
+#      or easily create a brand new GCP project if none exist or desired.
+#   2. Verifies Cloud Billing is enabled on the project (and links an active
+#      billing account automatically if needed).
+#   3. Enables the required Google Cloud APIs (Cloud Run, Artifact Registry,
+#      Cloud Build, IAM, Cloud Logging, Cloud Storage).
 #      - If you pass `--apis-only`, the script stops here so you can run locally
 #        with `python3 main.py`.
-#   3. Validates Python syntax across `main.py` and `examples/*.py`.
-#   4. Grants IAM roles (Cloud Logging) to the Cloud Run service account.
-#   5. Builds a container image via Google Cloud Build and deploys it to Cloud Run.
+#   4. Validates Python syntax across `main.py` and `examples/*.py`.
+#   5. Grants IAM roles (Cloud Logging) to the Cloud Run service account.
+#   6. Builds a container image via Google Cloud Build and deploys it to Cloud Run.
 # ==============================================================================
 
 # Exit immediately if any untested command exits with a non-zero status
@@ -31,9 +34,10 @@ CONFIG_FILE="$HOME/.dash_gcp_template_deploy.json"
 REQUIRED_APIS=(
     "run.googleapis.com"               # Google Cloud Run (serverless container hosting)
     "artifactregistry.googleapis.com"  # Artifact Registry (stores built Docker images)
-    "cloudbuild.googleapis.com"        # Cloud Build (builds the Docker container in GCP)
+    "cloudbuild.googleapis.com"        # Cloud Build (builds Docker container in GCP)
+    "storage.googleapis.com"           # Cloud Storage (staging buckets for Cloud Build)
     "iam.googleapis.com"               # Identity and Access Management (service account roles)
-    "logging.googleapis.com"           # Cloud Logging (application logs)
+    "logging.googleapis.com"           # Cloud Logging (application & access logs)
 )
 
 # IAM roles required by the default Compute Engine / Cloud Run service account at runtime
@@ -46,6 +50,9 @@ RUN_CHECKS=true
 FORCE_REBUILD=false
 ENABLE_APIS_ONLY=false
 PROJECT_ID_OVERRIDE=""
+BILLING_ACCOUNT_OVERRIDE=""
+CREATE_PROJECT_REQUESTED=false
+NEW_PROJECT_NAME_OVERRIDE=""
 
 # Temporary paths cleaned up automatically when the script exits
 ENV_YAML_FILE=""
@@ -66,12 +73,14 @@ show_help() {
     echo "Usage: ./run.sh [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --project <id>     Deploy to a specific GCP Project ID (skips interactive menu)"
-    echo "  --apis-only        Only enable required Google Cloud APIs and exit"
-    echo "  --skip-checks      Skip running local Python syntax validation"
-    echo "  --force, --rebuild Bypass all caches and force a full rebuild and redeploy"
-    echo "  -f                 Short alias for --force"
-    echo "  --help, -h         Display this reference and exit"
+    echo "  --project <id>          Deploy to a specific GCP Project ID (skips interactive menu)"
+    echo "  --create-project [name] Interactively create a new GCP Project"
+    echo "  --billing-account <id>  Link a specific Cloud Billing Account ID if billing is disabled"
+    echo "  --apis-only             Only enable required Google Cloud APIs and exit"
+    echo "  --skip-checks           Skip running local Python syntax validation"
+    echo "  --force, --rebuild      Bypass all caches and force a full rebuild and redeploy"
+    echo "  -f                      Short alias for --force"
+    echo "  --help, -h              Display this reference and exit"
     echo ""
     echo "⚡ Smart Caching Behavior (stored in ~/.dash_gcp_template_deploy.json):"
     echo "  • GCP APIs & IAM: Skipped if already enabled for the selected project."
@@ -82,7 +91,8 @@ show_help() {
     echo ""
     echo "Examples:"
     echo "  ./run.sh                         # Pick project [1-N], validate, build, and deploy"
-    echo "  ./run.sh --apis-only             # Pick project [1-N] and enable GCP APIs"
+    echo "  ./run.sh --create-project        # Create a new GCP project and deploy"
+    echo "  ./run.sh --apis-only             # Pick project [1-N] and enable GCP APIs for local runs"
     echo "  ./run.sh --project my-gcp-proj   # Deploy directly to 'my-gcp-proj'"
     echo "  ./run.sh --force                 # Force complete rebuild and redeploy from scratch"
     echo "================================================================="
@@ -97,14 +107,19 @@ from pathlib import Path
 
 hasher = hashlib.sha256()
 files = [Path("Dockerfile"), Path("requirements.txt"), Path("main.py")]
-data_dir = Path("data")
-if data_dir.exists():
-    files.extend(sorted(p for p in data_dir.rglob("*") if p.is_file()))
+
+for folder in ["data", "examples"]:
+    p_dir = Path(folder)
+    if p_dir.exists():
+        files.extend(sorted(p for p in p_dir.rglob("*") if p.is_file()))
 
 for path in files:
     if path.exists():
         hasher.update(str(path).encode("utf-8"))
-        hasher.update(path.read_bytes())
+        try:
+            hasher.update(path.read_bytes())
+        except Exception:
+            pass
 
 print(hasher.hexdigest())
 PYEOF
@@ -117,14 +132,22 @@ get_file_sha256() {
         echo ""
         return
     fi
-    python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$target_file" 2>/dev/null
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$target_file" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$target_file" 2>/dev/null | awk '{print $1}'
+    else
+        python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$target_file" 2>/dev/null
+    fi
 }
 
 # Executes a shell command quietly, shows its log output only if an error occurs,
 # and lets the user interactively Retry (1), Skip (2), or Abort (3) on failure.
+LAST_STEP_SKIPPED=false
 run_step() {
     local step_name="$1"
     local command="$2"
+    LAST_STEP_SKIPPED=false
 
     echo "⚙️  Running: $step_name..."
 
@@ -146,7 +169,7 @@ run_step() {
         read -p "Choice [1-3]: " fail_choice
         case $fail_choice in
             1) run_step "$step_name" "$command" ;;
-            2) return 0 ;;
+            2) LAST_STEP_SKIPPED=true; return 0 ;;
             *) exit 1 ;;
         esac
     else
@@ -167,6 +190,22 @@ while [[ "$#" -gt 0 ]]; do
                 shift
             else
                 echo "Error: --project requires a non-empty project ID argument."
+                exit 1
+            fi
+            ;;
+        --create-project)
+            CREATE_PROJECT_REQUESTED=true
+            if [ -n "$2" ] && [[ "$2" != --* ]]; then
+                NEW_PROJECT_NAME_OVERRIDE="$2"
+                shift
+            fi
+            ;;
+        --billing-account|-b)
+            if [ -n "$2" ] && [[ "$2" != --* ]]; then
+                BILLING_ACCOUNT_OVERRIDE="${2#billingAccounts/}"
+                shift
+            else
+                echo "Error: --billing-account requires a non-empty Billing Account ID."
                 exit 1
             fi
             ;;
@@ -207,12 +246,35 @@ echo "=================================================="
 echo ""
 
 # ==============================================================================
-# SECTION 4: Interactive GCP Project Selection
+# SECTION 4: Interactive GCP Project Selection & Creation
 # ==============================================================================
 CURRENT_GCLOUD_PROJECT=$(gcloud config get-value project 2>/dev/null)
 
+create_new_project_flow() {
+    local default_suffix=$((RANDOM % 90000 + 10000))
+    local default_id="dash-gcp-${default_suffix}"
+    
+    echo ""
+    echo "🆕 Creating a New Google Cloud Project"
+    echo "--------------------------------------------------"
+    read -p "👉 Enter Project ID (default: $default_id): " entered_id
+    entered_id=$(echo "$entered_id" | xargs)
+    local target_id="${entered_id:-$default_id}"
+
+    local default_name="${NEW_PROJECT_NAME_OVERRIDE:-Plotly Dash App}"
+    read -p "👉 Enter Project Display Name (default: $default_name): " entered_name
+    entered_name=$(echo "$entered_name" | xargs)
+    local target_name="${entered_name:-$default_name}"
+
+    echo ""
+    run_step "Create GCP Project '$target_id'" "gcloud projects create '$target_id' --name='$target_name' --quiet"
+    PROJECT_ID="$target_id"
+}
+
 if [ -n "$PROJECT_ID_OVERRIDE" ]; then
     PROJECT_ID="$PROJECT_ID_OVERRIDE"
+elif [ "$CREATE_PROJECT_REQUESTED" = true ]; then
+    create_new_project_flow
 else
     echo "🔍 Fetching available Google Cloud projects..."
     PROJECT_IDS=()
@@ -231,55 +293,7 @@ else
         CREATE_CHOICE=$(echo "$CREATE_CHOICE" | xargs)
 
         if [[ -z "$CREATE_CHOICE" || "$CREATE_CHOICE" =~ ^[Yy] ]]; then
-            DEFAULT_NEW_PROJECT_ID="dash-gcp-$((RANDOM % 90000 + 10000))"
-            read -p "👉 Enter a new Project ID (default: $DEFAULT_NEW_PROJECT_ID): " NEW_PROJECT_ID
-            NEW_PROJECT_ID=$(echo "$NEW_PROJECT_ID" | xargs)
-            PROJECT_ID="${NEW_PROJECT_ID:-$DEFAULT_NEW_PROJECT_ID}"
-
-            read -p "👉 Enter a display name for the project (default: $PROJECT_ID): " NEW_PROJECT_NAME
-            NEW_PROJECT_NAME=$(echo "$NEW_PROJECT_NAME" | xargs)
-            PROJECT_NAME="${NEW_PROJECT_NAME:-$PROJECT_ID}"
-
-            echo ""
-            run_step "Create GCP Project '$PROJECT_ID'" "gcloud projects create \"$PROJECT_ID\" --name=\"$PROJECT_NAME\""
-
-            # Check if an open billing account is available to link (required for Cloud Run & Cloud Build APIs)
-            BILLING_ACCOUNTS=()
-            BILLING_NAMES=()
-            while IFS=$'\t' read -r bid bname; do
-                if [ -n "$bid" ]; then
-                    BILLING_ACCOUNTS+=("$bid")
-                    BILLING_NAMES+=("$bname")
-                fi
-            done < <(gcloud billing accounts list --filter="open=true" --format="value(name.basename(),displayName)" 2>/dev/null)
-
-            BILLING_COUNT=${#BILLING_ACCOUNTS[@]}
-            if [ "$BILLING_COUNT" -eq 1 ]; then
-                echo "💳 Found active billing account: ${BILLING_NAMES[0]} (${BILLING_ACCOUNTS[0]})"
-                read -p "👉 Link this billing account to '$PROJECT_ID'? [Y/n]: " LINK_BILLING
-                LINK_BILLING=$(echo "$LINK_BILLING" | xargs)
-                if [[ -z "$LINK_BILLING" || "$LINK_BILLING" =~ ^[Yy] ]]; then
-                    run_step "Link Billing Account to '$PROJECT_ID'" "gcloud billing projects link \"$PROJECT_ID\" --billing-account=\"${BILLING_ACCOUNTS[0]}\""
-                fi
-            elif [ "$BILLING_COUNT" -gt 1 ]; then
-                echo ""
-                echo "Available Billing Accounts:"
-                echo "--------------------------------------------------"
-                for (( i=0; i<BILLING_COUNT; i++ )); do
-                    idx=$((i + 1))
-                    printf "  %2d) %-24s (%s)\n" "$idx" "${BILLING_ACCOUNTS[$i]}" "${BILLING_NAMES[$i]}"
-                done
-                echo "--------------------------------------------------"
-                read -p "👉 Select a billing account to link [1-$BILLING_COUNT] (or press Enter to skip): " BILLING_CHOICE
-                BILLING_CHOICE=$(echo "$BILLING_CHOICE" | xargs)
-                if [[ "$BILLING_CHOICE" =~ ^[0-9]+$ ]] && [ "$BILLING_CHOICE" -ge 1 ] && [ "$BILLING_CHOICE" -le "$BILLING_COUNT" ]; then
-                    SELECTED_BILLING="${BILLING_ACCOUNTS[$((BILLING_CHOICE - 1))]}"
-                    run_step "Link Billing Account to '$PROJECT_ID'" "gcloud billing projects link \"$PROJECT_ID\" --billing-account=\"$SELECTED_BILLING\""
-                fi
-            else
-                echo "⚠️  Note: No active billing accounts detected via gcloud. Make sure billing is enabled for '$PROJECT_ID' in the GCP Console before enabling APIs."
-                echo ""
-            fi
+            create_new_project_flow
         else
             read -p "👉 Please enter an existing target GCP Project ID manually: " PROJECT_ID
             PROJECT_ID=$(echo "$PROJECT_ID" | xargs)
@@ -296,15 +310,20 @@ else
             fi
             printf "  %2d) %-32s (%s)%s\n" "$idx" "${PROJECT_IDS[$i]}" "${PROJECT_NAMES[$i]}" "$marker"
         done
+        create_option=$((PROJECT_COUNT + 1))
+        printf "  %2d) ➕ [Create a new GCP Project]\n" "$create_option"
         echo "--------------------------------------------------"
-        read -p "👉 Select a project by number [1-$PROJECT_COUNT]: " PROJECT_CHOICE
+        read -p "👉 Select a project by number [1-$create_option]: " PROJECT_CHOICE
         PROJECT_CHOICE=$(echo "$PROJECT_CHOICE" | xargs)
 
-        if ! [[ "$PROJECT_CHOICE" =~ ^[0-9]+$ ]] || [ "$PROJECT_CHOICE" -lt 1 ] || [ "$PROJECT_CHOICE" -gt "$PROJECT_COUNT" ]; then
-            echo "❌ Error: Invalid selection '$PROJECT_CHOICE'. Please enter a number between 1 and $PROJECT_COUNT."
+        if [ "$PROJECT_CHOICE" = "$create_option" ]; then
+            create_new_project_flow
+        elif [[ "$PROJECT_CHOICE" =~ ^[0-9]+$ ]] && [ "$PROJECT_CHOICE" -ge 1 ] && [ "$PROJECT_CHOICE" -le "$PROJECT_COUNT" ]; then
+            PROJECT_ID="${PROJECT_IDS[$((PROJECT_CHOICE - 1))]}"
+        else
+            echo "❌ Error: Invalid selection '$PROJECT_CHOICE'. Please enter a number between 1 and $create_option."
             exit 1
         fi
-        PROJECT_ID="${PROJECT_IDS[$((PROJECT_CHOICE - 1))]}"
     fi
 fi
 
@@ -313,6 +332,7 @@ if [ -z "$PROJECT_ID" ]; then
     exit 1
 fi
 
+# Export standard GCP project environment variables
 export PROJECT_ID
 export CLOUDSDK_CORE_PROJECT="$PROJECT_ID"
 export GOOGLE_CLOUD_PROJECT="$PROJECT_ID"
@@ -334,6 +354,8 @@ APIS_INITIALIZED="false"
 IAM_INITIALIZED="false"
 INFRA_INITIALIZED="false"
 LAST_DEPLOYED_PROJECT_ID=""
+LAST_ENABLED_APIS=""
+LAST_IAM_ROLES=""
 LAST_SOURCE_HASH=""
 LAST_ENV_HASH=""
 
@@ -355,6 +377,8 @@ updates = {
     'APIS_INITIALIZED': '$APIS_INITIALIZED',
     'IAM_INITIALIZED': '$IAM_INITIALIZED',
     'INFRA_INITIALIZED': '$INFRA_INITIALIZED',
+    'LAST_ENABLED_APIS': '$LAST_ENABLED_APIS',
+    'LAST_IAM_ROLES': '$LAST_IAM_ROLES',
     'LAST_SOURCE_HASH': '$LAST_SOURCE_HASH',
     'LAST_ENV_HASH': '$LAST_ENV_HASH'
 }
@@ -379,28 +403,218 @@ except Exception:
 ")"
 fi
 
+# Reset cached flags if switching GCP projects
 if [ -n "$LAST_DEPLOYED_PROJECT_ID" ] && [ "$PROJECT_ID" != "$LAST_DEPLOYED_PROJECT_ID" ]; then
     echo "ℹ️  Switched GCP Project ($PROJECT_ID vs previous $LAST_DEPLOYED_PROJECT_ID). Resetting setup cache."
     APIS_INITIALIZED="false"
     IAM_INITIALIZED="false"
     INFRA_INITIALIZED="false"
+    LAST_ENABLED_APIS=""
+    LAST_IAM_ROLES=""
     LAST_SOURCE_HASH=""
     LAST_ENV_HASH=""
 fi
 
 # ==============================================================================
-# SECTION 6: Google Cloud API Enablement (--apis-only or Full Deploy)
+# SECTION 6: Cloud Billing Verification & Google Cloud API Enablement
 # ==============================================================================
-enable_required_apis() {
-    if [ "$FORCE_REBUILD" = false ] && [ "$APIS_INITIALIZED" = "true" ] && [ "$PROJECT_ID" = "$LAST_DEPLOYED_PROJECT_ID" ]; then
-        echo "⚡ Google Cloud APIs already enabled for $PROJECT_ID (skipping; use --force to re-verify)."
+# Ensures an active Cloud Billing account is linked to $PROJECT_ID before
+# enabling billing-gated services (Cloud Run, Artifact Registry, Cloud Build).
+BILLING_CHECKED=false
+ensure_billing_enabled() {
+    if [ "$BILLING_CHECKED" = true ]; then
+        return 0
+    fi
+    BILLING_CHECKED=true
+
+    local billing_cmd="gcloud billing"
+    if ! gcloud billing --help >/dev/null 2>&1; then
+        billing_cmd="gcloud beta billing"
+    fi
+
+    local billing_json=""
+    local describe_ok=false
+    if billing_json=$($billing_cmd projects describe "$PROJECT_ID" --format="json" 2>/dev/null); then
+        describe_ok=true
+    fi
+
+    if [ "$describe_ok" = true ]; then
+        local is_enabled
+        is_enabled=$(BILLING_JSON="$billing_json" python3 -c '
+import json, os
+try:
+    data = json.loads(os.environ.get("BILLING_JSON", "{}") or "{}")
+    print("true" if data.get("billingEnabled") is True else "false")
+except Exception:
+    print("unknown")
+')
+        if [ "$is_enabled" = "true" ]; then
+            echo "⚡ Cloud Billing is active for $PROJECT_ID."
+            return 0
+        fi
     else
-        run_step "Enable Google Cloud APIs" "gcloud services enable ${REQUIRED_APIS[*]} --project $PROJECT_ID"
-        APIS_INITIALIZED="true"
-        save_config_state
+        # If billing info cannot be read (e.g., restricted role on shared project), proceed unless override provided
+        if [ -z "$BILLING_ACCOUNT_OVERRIDE" ]; then
+            return 0
+        fi
+    fi
+
+    echo "⚠️  Cloud Billing is not enabled for project '$PROJECT_ID'."
+    local selected_account="$BILLING_ACCOUNT_OVERRIDE"
+    local selected_name=""
+
+    if [ -z "$selected_account" ]; then
+        echo "🔍 Checking available active Cloud Billing accounts..."
+        local accounts_json="[]"
+        accounts_json=$($billing_cmd accounts list --filter="open=true" --format="json" 2>/dev/null || echo "[]")
+
+        local account_ids=()
+        local account_names=()
+        while IFS=$'\t' read -r aid aname; do
+            if [ -n "$aid" ]; then
+                account_ids+=("$aid")
+                account_names+=("$aname")
+            fi
+        done < <(ACCOUNTS_JSON="$accounts_json" python3 -c '
+import json, os
+try:
+    items = json.loads(os.environ.get("ACCOUNTS_JSON", "[]") or "[]")
+    for item in items:
+        if item.get("open") is False:
+            continue
+        raw_name = str(item.get("name", "")).strip()
+        aid = raw_name.split("/")[-1] if raw_name else ""
+        dname = str(item.get("displayName", "Billing Account")).replace("\t", " ").strip()
+        if aid:
+            print(f"{aid}\t{dname}")
+except Exception:
+    pass
+')
+
+        local account_count=${#account_ids[@]}
+        if [ "$account_count" -eq 1 ]; then
+            selected_account="${account_ids[0]}"
+            selected_name="${account_names[0]}"
+            echo "💳 Found active billing account: $selected_name ($selected_account)"
+        elif [ "$account_count" -gt 1 ]; then
+            echo ""
+            echo "Available Active Cloud Billing Accounts:"
+            echo "--------------------------------------------------"
+            for (( i=0; i<account_count; i++ )); do
+                idx=$((i + 1))
+                printf "  %2d) %-24s (%s)\n" "$idx" "${account_ids[$i]}" "${account_names[$i]}"
+            done
+            echo "--------------------------------------------------"
+            read -p "👉 Select a billing account to link to '$PROJECT_ID' [1-$account_count]: " billing_choice
+            billing_choice=$(echo "$billing_choice" | xargs)
+            if ! [[ "$billing_choice" =~ ^[0-9]+$ ]] || [ "$billing_choice" -lt 1 ] || [ "$billing_choice" -gt "$account_count" ]; then
+                echo "❌ Error: Invalid selection '$billing_choice'. Please enter a number between 1 and $account_count."
+                exit 1
+            fi
+            selected_account="${account_ids[$((billing_choice - 1))]}"
+            selected_name="${account_names[$((billing_choice - 1))]}"
+        else
+            echo "⚠️  No active Cloud Billing accounts were found automatically."
+            echo "   You can create or view your billing account at:"
+            echo "     https://console.cloud.google.com/billing"
+            echo "   Or link one directly in the Console for '$PROJECT_ID' at:"
+            echo "     https://console.cloud.google.com/billing/linkedaccount?project=$PROJECT_ID"
+            echo ""
+            read -p "👉 Enter a Billing Account ID (e.g. 012345-6789AB-CDEF01), or press Enter if you linked it in browser: " manual_account
+            selected_account=$(echo "$manual_account" | xargs)
+            selected_account="${selected_account#billingAccounts/}"
+        fi
+    fi
+
+    if [ -n "$selected_account" ]; then
+        local label="$selected_account"
+        if [ -n "$selected_name" ]; then
+            label="$selected_name ($selected_account)"
+        fi
+        run_step "Link Cloud Billing Account ($label) to $PROJECT_ID" "$billing_cmd projects link '$PROJECT_ID' --billing-account='$selected_account' --quiet"
+        if [ "$LAST_STEP_SKIPPED" = false ]; then
+            sleep 2
+        fi
+    else
+        local recheck_json=""
+        recheck_json=$($billing_cmd projects describe "$PROJECT_ID" --format="json" 2>/dev/null || echo "{}")
+        local now_enabled
+        now_enabled=$(BILLING_JSON="$recheck_json" python3 -c '
+import json, os
+try:
+    data = json.loads(os.environ.get("BILLING_JSON", "{}") or "{}")
+    print("true" if data.get("billingEnabled") is True else "false")
+except Exception:
+    print("false")
+')
+        if [ "$now_enabled" != "true" ]; then
+            echo "❌ Error: Cloud Billing is still not enabled for '$PROJECT_ID'. Billing is required to activate Cloud Run, Artifact Registry, and Cloud Build APIs."
+            exit 1
+        fi
+        echo "✅ Confirmed Cloud Billing is now active for $PROJECT_ID!"
+        echo ""
     fi
 }
 
+# Verify billing upfront when setting up a new/switched project
+if [ "$APIS_INITIALIZED" != "true" ] || [ "$FORCE_REBUILD" = true ] || [ -n "$BILLING_ACCOUNT_OVERRIDE" ]; then
+    ensure_billing_enabled
+fi
+
+# Enables missing Google Cloud APIs automatically
+enable_required_apis() {
+    local required_apis_str="${REQUIRED_APIS[*]}"
+
+    if [ "$FORCE_REBUILD" = true ]; then
+        ensure_billing_enabled
+        run_step "Enable Google Cloud APIs" "gcloud services enable ${REQUIRED_APIS[*]} --project=$PROJECT_ID --quiet"
+        if [ "$LAST_STEP_SKIPPED" = false ]; then
+            APIS_INITIALIZED="true"
+            LAST_ENABLED_APIS="$required_apis_str"
+            save_config_state
+        fi
+        return
+    fi
+
+    local enabled_apis
+    if ! enabled_apis=$(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" --quiet 2>/dev/null); then
+        ensure_billing_enabled
+        run_step "Enable Google Cloud APIs" "gcloud services enable ${REQUIRED_APIS[*]} --project=$PROJECT_ID --quiet"
+        if [ "$LAST_STEP_SKIPPED" = false ]; then
+            APIS_INITIALIZED="true"
+            LAST_ENABLED_APIS="$required_apis_str"
+            save_config_state
+        fi
+        return
+    fi
+
+    local missing_apis=()
+    for api in "${REQUIRED_APIS[@]}"; do
+        if ! printf '%s\n' "$enabled_apis" | grep -Fxq "$api"; then
+            missing_apis+=("$api")
+        fi
+    done
+
+    if [ "${#missing_apis[@]}" -eq 0 ]; then
+        echo "⚡ All required Google Cloud APIs are enabled for $PROJECT_ID."
+        if [ "$APIS_INITIALIZED" != "true" ] || [ "$LAST_ENABLED_APIS" != "$required_apis_str" ]; then
+            APIS_INITIALIZED="true"
+            LAST_ENABLED_APIS="$required_apis_str"
+            save_config_state
+        fi
+    else
+        echo "ℹ️  Missing required API(s) on $PROJECT_ID: ${missing_apis[*]}"
+        ensure_billing_enabled
+        run_step "Enable Missing Google Cloud APIs (${missing_apis[*]})" "gcloud services enable ${missing_apis[*]} --project=$PROJECT_ID --quiet"
+        if [ "$LAST_STEP_SKIPPED" = false ]; then
+            APIS_INITIALIZED="true"
+            LAST_ENABLED_APIS="$required_apis_str"
+            save_config_state
+        fi
+    fi
+}
+
+# If the user ran `./run.sh --apis-only` (for local development), enable APIs and exit now
 if [ "$ENABLE_APIS_ONLY" = true ]; then
     echo "=== Enabling Required Google Cloud APIs for $PROJECT_ID ==="
     enable_required_apis
@@ -427,10 +641,12 @@ fi
 echo "=== Step 2: Google Cloud APIs & IAM Permissions ==="
 enable_required_apis
 
+# Look up default Compute Engine service account used by Cloud Run
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
 DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 
-if [ "$FORCE_REBUILD" = false ] && [ "$IAM_INITIALIZED" = "true" ] && [ "$PROJECT_ID" = "$LAST_DEPLOYED_PROJECT_ID" ]; then
+CURRENT_IAM_ROLES="${REQUIRED_IAM_ROLES[*]}"
+if [ "$FORCE_REBUILD" = false ] && [ "$IAM_INITIALIZED" = "true" ] && [ "$PROJECT_ID" = "$LAST_DEPLOYED_PROJECT_ID" ] && [ "$LAST_IAM_ROLES" = "$CURRENT_IAM_ROLES" ]; then
     echo "⚡ IAM permissions already configured for $DEFAULT_SA (use --force to re-verify)."
 else
     IAM_CMD=""
@@ -441,8 +657,11 @@ else
         IAM_CMD="${IAM_CMD}gcloud projects add-iam-policy-binding $PROJECT_ID --member='serviceAccount:$DEFAULT_SA' --role='$role' --quiet"
     done
     run_step "Grant Cloud Logging IAM Role" "$IAM_CMD"
-    IAM_INITIALIZED="true"
-    save_config_state
+    if [ "$LAST_STEP_SKIPPED" = false ]; then
+        IAM_INITIALIZED="true"
+        LAST_IAM_ROLES="$CURRENT_IAM_ROLES"
+        save_config_state
+    fi
 fi
 
 # ==============================================================================
@@ -450,6 +669,7 @@ fi
 # ==============================================================================
 echo "=== Step 3: Cloud Run Deployment ==="
 
+# 1. Ensure the Docker repository exists in Artifact Registry
 if [ "$FORCE_REBUILD" = false ] && [ "$INFRA_INITIALIZED" = "true" ] && [ "$PROJECT_ID" = "$LAST_DEPLOYED_PROJECT_ID" ]; then
     echo "⚡ Artifact Registry repository ($REPO_NAME) already initialized."
 else
@@ -458,6 +678,7 @@ else
     save_config_state
 fi
 
+# 2. Generate runtime environment variables file for the Cloud Run service
 ENV_YAML_FILE="/tmp/dash_gcp_env.yaml"
 cat <<EOF > "$ENV_YAML_FILE"
 GCP_PROJECT: "$PROJECT_ID"
@@ -468,6 +689,7 @@ CURRENT_SOURCE_HASH=$(get_source_sha256)
 CURRENT_ENV_HASH=$(get_file_sha256 "$ENV_YAML_FILE")
 IMAGE_TAG="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${SERVICE_NAME}:latest"
 
+# 3. Check if the container image already exists in Artifact Registry
 IMAGE_EXISTS=false
 if gcloud artifacts docker images describe "$IMAGE_TAG" --project "$PROJECT_ID" --format='value(image_summary.digest)' >/dev/null 2>&1; then
     IMAGE_EXISTS=true
