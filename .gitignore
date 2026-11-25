@@ -18,3 +18,9 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+# BLS data downloaded by fetch_bls_data.py (not committed; re-run the script)
+data/bls_*.csv
+
+# Secrets
+.env
