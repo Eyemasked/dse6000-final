@@ -27,7 +27,7 @@ export TMPDIR=/tmp
 # ==============================================================================
 REGION="us-central1"
 REPO_NAME="dash-app-repo"
-SERVICE_NAME="dash-gcp-app"
+SERVICE_NAME="dse6000-final"
 CONFIG_FILE="$HOME/.dash_gcp_template_deploy.json"
 
 # Google Cloud APIs required by the application and deployment pipeline
