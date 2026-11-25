@@ -12,3 +12,4 @@ examples/
 README.md
 run.sh
 .DS_Store
+.env

@@ -157,6 +157,21 @@ Open your browser to:
 
 ---
 
+## Getting the BLS Data (every teammate, once)
+
+The BLS datasets are **not committed** to git (`data/bls_*.csv` is in `.gitignore`), so after cloning you need to download them yourself. This runs locally and does not need gcloud:
+
+```bash
+source myenv/bin/activate          # with requirements.txt installed
+# Optional: higher API limits with a free key from https://data.bls.gov/registrationEngine/
+# export BLS_API_KEY=your_key_here
+python3 fetch_bls_data.py
+```
+
+This writes four files to `data/`: `bls_timeseries.csv`, `bls_qcew_county.csv`, `bls_oews_msa.csv` and `bls_oews_national.csv`. Whoever runs `./run.sh` to deploy must have these files locally, because they are uploaded with the build.
+
+---
+
 ## `run.sh` Options Reference
 
 | Option | Description |
